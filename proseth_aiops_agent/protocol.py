@@ -15,6 +15,7 @@ customer network. Every frame is one JSON object with a `t` field.
     result     job finished               upgrade    fetch the release, reinstall
     alert      a monitoring alert         restart    exit; systemd brings it back
                                           alert_ack  that alert is STORED
+                                          config     the log rules (gate 1) to apply
                                           denied     refused (bad token...)
 
 Alerts are stored by the platform BEFORE alert_ack is sent; the agent keeps
@@ -37,6 +38,10 @@ HELLO, HEARTBEAT, PONG, OUTPUT, RESULT, ALERT = (
     "hello", "heartbeat", "pong", "output", "result", "alert")
 WELCOME, PING, JOB, CANCEL, UPGRADE, RESTART, ALERT_ACK, DENIED = (
     "welcome", "ping", "job", "cancel", "upgrade", "restart", "alert_ack", "denied")
+# The log rules this collector applies to syslog / SNMP traps (rules.py). Sent
+# after WELCOME and whenever they change; the agent caches them on disk so it
+# keeps filtering through a platform outage. Carries NO secrets.
+CONFIG = "config"
 
 # Job kinds. Each runs INSIDE the customer network.
 JOB_SSH = "ssh"            # a bash script on a Linux host, over SSH
@@ -44,7 +49,8 @@ JOB_WINRM = "winrm"        # a PowerShell script on a Windows host, over WinRM
 JOB_NETMIKO = "netmiko"    # read-only CLI on a network device
 JOB_PROBE = "probe"        # connect + facts
 JOB_SHELL = "shell"        # on the collector itself
-JOB_KINDS = (JOB_SSH, JOB_WINRM, JOB_NETMIKO, JOB_PROBE, JOB_SHELL)
+JOB_CHECKS = "checks"      # a batch of ping / tcp / http / snmp_if checks (agent 1.1.0+)
+JOB_KINDS = (JOB_SSH, JOB_WINRM, JOB_NETMIKO, JOB_PROBE, JOB_SHELL, JOB_CHECKS)
 
 
 def frame(frame_type: str, /, **fields: Any) -> str:

@@ -375,5 +375,146 @@ def run_winrm(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
             pass
 
 
+# ------------------------------------------------------------------- checks
+#
+# Network checks the platform schedules: many in ONE job, run in parallel, so a
+# site with 200 assets is one frame a minute rather than 200. Read-only by
+# construction - ping, a TCP connect, an HTTP GET, an SNMP GET.
+
+def _check_ping(c: dict) -> dict:
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(["ping", "-c", "1", "-W", str(int(c.get("timeout") or 2)),
+                            c["target"]], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "message": f"ping could not run: {exc}"}
+    ms = round((time.monotonic() - t0) * 1000)
+    if r.returncode == 0:
+        import re  # noqa: PLC0415
+        m = re.search(r"time[=<]([\d.]+)", r.stdout)
+        return {"ok": True, "value": float(m.group(1)) if m else ms, "message": "reply"}
+    return {"ok": False, "message": "no reply"}
+
+
+def _check_tcp(c: dict) -> dict:
+    import socket  # noqa: PLC0415
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection((c["target"], int(c["port"])), timeout=float(c.get("timeout") or 3)):
+            pass
+    except OSError as exc:
+        return {"ok": False, "message": f"port {c['port']} closed ({exc.__class__.__name__})"}
+    return {"ok": True, "value": round((time.monotonic() - t0) * 1000), "message": f"port {c['port']} open"}
+
+
+def _check_http(c: dict) -> dict:
+    import ssl  # noqa: PLC0415
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+    url = c["url"]
+    ctx = ssl.create_default_context()
+    if not c.get("verify_tls", True):
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    t0 = time.monotonic()
+    out: dict = {}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "proseth-aiops-collector"})
+        with urllib.request.urlopen(req, timeout=float(c.get("timeout") or 10), context=ctx) as r:
+            status = r.status
+            body = r.read(65536).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        status, body = exc.code, ""
+    except (urllib.error.URLError, OSError, ssl.SSLError) as exc:
+        return {"ok": False, "message": f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"[:300]}
+    out["value"] = round((time.monotonic() - t0) * 1000)
+    out["status"] = status
+    if url.startswith("https://"):
+        try:
+            import socket  # noqa: PLC0415
+            from urllib.parse import urlparse  # noqa: PLC0415
+            u = urlparse(url)
+            raw_ctx = ssl.create_default_context()
+            raw_ctx.check_hostname, raw_ctx.verify_mode = False, ssl.CERT_NONE
+            # A second, non-verifying connection: the certificate is read even
+            # when it has expired - which is exactly the case worth reporting.
+            with socket.create_connection((u.hostname, u.port or 443), timeout=5) as s, \
+                    raw_ctx.wrap_socket(s, server_hostname=u.hostname) as ss:
+                der = ss.getpeercert(binary_form=True)
+        except Exception:  # noqa: BLE001
+            der = None
+        if der is not None:
+            out["cert_days"] = _cert_days(der)
+    want = c.get("expect_status") or [200, 201, 202, 204, 301, 302, 303, 307, 308]
+    if status not in want:
+        return {**out, "ok": False, "message": f"HTTP {status}"}
+    if c.get("expect_text") and c["expect_text"] not in body:
+        return {**out, "ok": False, "message": f"page does not contain '{c['expect_text']}'"}
+    return {**out, "ok": True, "message": f"HTTP {status}"}
+
+
+def _cert_days(der: bytes) -> int | None:
+    """Days until the certificate's notAfter, read straight from the DER."""
+    import re  # noqa: PLC0415
+    from datetime import datetime, timezone  # noqa: PLC0415
+    # notAfter is the second UTCTime/GeneralizedTime in the validity sequence.
+    times = re.findall(rb"\x17\x0d(\d{12}Z)|\x18\x0f(\d{14}Z)", der)
+    if len(times) < 2:
+        return None
+    utc, gen = times[1]
+    try:
+        if utc:
+            dt = datetime.strptime(utc.decode(), "%y%m%d%H%M%SZ")
+        else:
+            dt = datetime.strptime(gen.decode(), "%Y%m%d%H%M%SZ")
+    except ValueError:
+        return None
+    return (dt.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
+
+
+def _check_snmp_if(c: dict) -> dict:
+    """ifOperStatus for the listed ifIndexes (or a sysUpTime reachability check)."""
+    from . import snmp  # noqa: PLC0415
+    idx = c.get("if_indexes") or []
+    oids = ["1.3.6.1.2.1.1.3.0"] + [f"1.3.6.1.2.1.2.2.1.8.{i}" for i in idx] + \
+           [f"1.3.6.1.2.1.2.2.1.2.{i}" for i in idx]
+    try:
+        vals = snmp.get(c["target"], c.get("community") or "public", oids,
+                        port=int(c.get("port") or 161), timeout=float(c.get("timeout") or 3))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"SNMP did not answer ({type(exc).__name__})"}
+    down = []
+    for i in idx:
+        st = vals.get(f"1.3.6.1.2.1.2.2.1.8.{i}")
+        if st and st != "1":
+            down.append(vals.get(f"1.3.6.1.2.1.2.2.1.2.{i}") or f"ifIndex {i}")
+    uptime = vals.get("1.3.6.1.2.1.1.3.0")
+    out = {"uptime_ticks": int(uptime) if uptime and uptime.isdigit() else None}
+    if down:
+        return {**out, "ok": False, "message": "down: " + ", ".join(down)}
+    return {**out, "ok": True, "value": len(idx), "message": f"{len(idx)} interface(s) up"}
+
+
+_CHECKS = {"ping": _check_ping, "tcp": _check_tcp, "http": _check_http, "snmp_if": _check_snmp_if}
+
+
+def run_checks(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
+    checks = payload.get("checks") or []
+    results: list[dict] = []
+
+    def one(c: dict) -> dict:
+        fn = _CHECKS.get(c.get("kind", ""))
+        if fn is None:
+            return {"id": c.get("id"), "ok": False, "message": f"unknown check '{c.get('kind')}'"}
+        try:
+            return {"id": c.get("id"), **fn(c)}
+        except Exception as exc:  # noqa: BLE001
+            return {"id": c.get("id"), "ok": False, "message": f"{type(exc).__name__}: {exc}"[:300]}
+
+    with ThreadPoolExecutor(max_workers=min(32, max(1, len(checks)))) as pool:
+        for r in pool.map(one, checks):
+            results.append(r)
+    return {"ok": True, "results": results}
+
+
 HANDLERS = {"shell": run_shell, "ssh": run_ssh, "winrm": run_winrm,
-            "netmiko": run_netmiko, "probe": run_probe}
+            "netmiko": run_netmiko, "probe": run_probe, "checks": run_checks}

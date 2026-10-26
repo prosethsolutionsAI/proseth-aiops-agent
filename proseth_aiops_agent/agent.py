@@ -19,12 +19,12 @@ import signal
 import sys
 from pathlib import Path
 
-from . import alerts, facts, protocol
+from . import alerts, facts, protocol, receivers
 from .jobs import EXECUTOR, HANDLERS
 
 # The ONE place the version is written. The installer reads it with sed and it
 # goes up in HELLO. Bump it when the agent or installer changes.
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 CONFIG_PATH = Path(os.environ.get("AIOPS_AGENT_CONFIG",
                                   "/etc/proseth-aiops-agent/config.json"))
@@ -77,6 +77,11 @@ class Agent:
         self.alert_port = int(config.get("alert_port") or protocol.DEFAULT_ALERT_PORT)
         self.alert_queue: alerts.AlertQueue | None = None
         self._alert_wake: asyncio.Event | None = None
+        # Syslog / SNMP-trap receivers (opt-in at install). 0 = off.
+        self.syslog_port = int(config.get("syslog_port") or 0)
+        self.trap_port = int(config.get("trap_port") or 0)
+        self.trap_communities = {c for c in (config.get("trap_communities") or []) if c}
+        self.filter: receivers.Filter | None = None
 
         if not self.host or not self.token:
             log.error("Configuration is missing the platform address or the token. "
@@ -90,7 +95,9 @@ class Agent:
     # -- alert relay --------------------------------------------------------
 
     def start_alerts(self) -> None:
-        if not self.alert_secret:
+        """The queue, the webhook listener (if a secret is set) and the
+        syslog / trap receivers (if ports are set). Nothing here is fatal."""
+        if not (self.alert_secret or self.syslog_port or self.trap_port):
             return
         loop = asyncio.get_running_loop()
         self._alert_wake = asyncio.Event()
@@ -102,15 +109,22 @@ class Agent:
                 pass
         try:
             self.alert_queue = alerts.AlertQueue(STATE_DIR / "alerts")
-            alerts.AlertListener(self.alert_port, self.alert_secret,
-                                 self.alert_queue, wake).start()
         except OSError as exc:
-            log.error("Alert intake could not start on :%s (%s) - deploys still work",
-                      self.alert_port, exc)
-            self.alert_queue = None
+            log.error("Alert queue unavailable (%s) - alerts cannot be relayed", exc)
             return
-        log.info("Accepting alerts on :%s (%s queued)", self.alert_port,
-                 self.alert_queue.depth())
+        if self.alert_secret:
+            try:
+                alerts.AlertListener(self.alert_port, self.alert_secret,
+                                     self.alert_queue, wake).start()
+                log.info("Accepting webhook alerts on :%s (%s queued)", self.alert_port,
+                         self.alert_queue.depth())
+            except OSError as exc:
+                log.error("Webhook listener could not start on :%s (%s)", self.alert_port, exc)
+        if self.syslog_port or self.trap_port:
+            self.filter = receivers.Filter(self.alert_queue, wake, STATE_DIR / "rules.json")
+            receivers.start(self.filter, syslog_port=self.syslog_port or None,
+                            trap_port=self.trap_port or None,
+                            communities=self.trap_communities)
 
     async def relay_alerts(self) -> None:
         q = self.alert_queue
@@ -215,8 +229,16 @@ class Agent:
         while True:
             await asyncio.sleep(interval)
             payload = await asyncio.get_running_loop().run_in_executor(None, facts.collect)
-            if not await self.send(protocol.HEARTBEAT, facts=payload):
+            if not await self.send(protocol.HEARTBEAT, facts=payload, ingest=self.ingest()):
                 return
+
+    def ingest(self) -> dict:
+        """What the receivers saw: received / dropped / suppressed / forwarded."""
+        out = self.filter.snapshot() if self.filter is not None else {}
+        out["listening"] = {"webhook": bool(self.alert_secret), "syslog": self.syslog_port,
+                            "trap": self.trap_port}
+        out["queued"] = self.alert_queue.depth() if self.alert_queue is not None else 0
+        return out
 
     async def send(self, kind: str, **fields) -> bool:
         socket = self.websocket
@@ -241,6 +263,9 @@ class Agent:
         elif kind == protocol.ALERT_ACK:
             if self.alert_queue is not None:
                 self.alert_queue.ack(str(frame.get("id") or ""))
+        elif kind == protocol.CONFIG:
+            if self.filter is not None:
+                self.filter.set_rules(frame)
         elif kind == protocol.RESTART:
             log.info("Restart requested - exiting for systemd to bring us back")
             self._restarting = True

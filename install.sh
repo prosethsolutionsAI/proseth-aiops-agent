@@ -52,9 +52,12 @@ echo "  This machine connects OUT to the platform. Nothing connects in."
 echo
 
 E_HOST=""; E_PORT=""; E_NAME=""; E_TOKEN=""; E_ALERT_SECRET=""; E_ALERT_PORT=""
+E_SYSLOG=""; E_TRAP=""; E_COMMUNITY=""
 if [ -f "$CONFIG" ]; then
   E_HOST=$(cfg platform_host); E_PORT=$(cfg platform_port); E_NAME=$(cfg collector_name)
   E_TOKEN=$(cfg token); E_ALERT_SECRET=$(cfg alert_secret); E_ALERT_PORT=$(cfg alert_port)
+  E_SYSLOG=$(cfg syslog_port); E_TRAP=$(cfg trap_port)
+  E_COMMUNITY=$(python3 -c "import json;print(','.join(json.load(open('$CONFIG')).get('trap_communities',[])))" 2>/dev/null || true)
   say "Existing configuration found - press Enter to keep each value."
 fi
 E_HOST="${AIOPS_PLATFORM_HOST:-$E_HOST}"
@@ -86,6 +89,24 @@ case "${WANT,,}" in
          [ -n "$ALERT_SECRET" ] || { ALERT_SECRET="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"; NEW_SECRET=1; } ;;
   *) ALERT_SECRET="" ;;
 esac
+
+say "Syslog and SNMP traps (optional)"
+yesno() {  # yesno <prompt> <env-value> <existing-on> -> echoes y|n
+  local env="$2" on="$3" a
+  if [ -n "$NONINTERACTIVE" ]; then
+    case "$env" in 1|y|yes|true) echo y ;; 0|n|no|false) echo n ;; *) [ -n "$on" ] && echo y || echo n ;; esac
+    return
+  fi
+  local def=N; [ -n "$on" ] && def=Y
+  printf "  %s [%s]: " "$1" "$def" >&2; read -r a; a="${a:-$def}"
+  case "${a,,}" in y|yes) echo y ;; *) echo n ;; esac
+}
+SYSLOG_PORT=""; TRAP_PORT=""; TRAP_COMMUNITIES=""
+[ "$(yesno 'Receive syslog from devices and servers on this network (514)?' "${AIOPS_SYSLOG:-}" "$E_SYSLOG")" = y ] && SYSLOG_PORT=514
+if [ "$(yesno 'Receive SNMP traps (162)?' "${AIOPS_TRAPS:-}" "$E_TRAP")" = y ]; then
+  TRAP_PORT=162
+  ask "Accepted trap community (comma-separated, blank = any)" "${AIOPS_TRAP_COMMUNITY:-$E_COMMUNITY}" TRAP_COMMUNITIES
+fi
 
 say "Checking this machine can reach $P_HOST:$P_PORT"
 if timeout 8 bash -c "exec 3<>/dev/tcp/$P_HOST/$P_PORT" 2>/dev/null; then
@@ -157,6 +178,14 @@ fi
 ALERT_LINE=""
 [ -n "$ALERT_SECRET" ] && ALERT_LINE="  \"alert_port\": $ALERT_PORT,
   \"alert_secret\": \"$ALERT_SECRET\","
+RECV_LINE=""
+[ -n "$SYSLOG_PORT" ] && RECV_LINE="  \"syslog_port\": $SYSLOG_PORT,"
+if [ -n "$TRAP_PORT" ]; then
+  COMM_JSON="$(python3 -c 'import json,sys;print(json.dumps([c.strip() for c in sys.argv[1].split(",") if c.strip()]))' "$TRAP_COMMUNITIES")"
+  RECV_LINE="$RECV_LINE
+  \"trap_port\": $TRAP_PORT,
+  \"trap_communities\": $COMM_JSON,"
+fi
 cat > "$CONFIG" <<JSON
 {
   "collector_name": "$C_NAME",
@@ -165,6 +194,7 @@ cat > "$CONFIG" <<JSON
   "tls": true,
 $CA_LINE
 $ALERT_LINE
+$RECV_LINE
   "token": "$C_TOKEN"
 }
 JSON
@@ -214,6 +244,8 @@ Environment=HOME=$STATE_DIR
 ExecStart=$PREFIX/venv/bin/python -m proseth_aiops_agent.agent
 Restart=always
 RestartSec=5
+# Only so the unprivileged agent can listen on syslog 514 / traps 162.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=false
 
 [Install]
@@ -236,6 +268,13 @@ if [ -n "$ALERT_SECRET" ]; then
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     warn "ufw is active - allow port $ALERT_PORT from the monitoring server only"
   fi
+fi
+
+[ -n "$SYSLOG_PORT" ] && ok "receiving syslog on udp+tcp/$SYSLOG_PORT (point devices at this machine's IP)"
+[ -n "$TRAP_PORT" ] && ok "receiving SNMP traps on udp/$TRAP_PORT"
+if { [ -n "$SYSLOG_PORT" ] || [ -n "$TRAP_PORT" ]; } && command -v ufw >/dev/null 2>&1 \
+   && ufw status 2>/dev/null | grep -q "Status: active"; then
+  warn "ufw is active - allow 514/udp,514/tcp,162/udp from your devices"
 fi
 
 say "Waiting for it to connect"
