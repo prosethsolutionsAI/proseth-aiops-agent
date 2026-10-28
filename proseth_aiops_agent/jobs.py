@@ -417,13 +417,23 @@ def _check_http(c: dict) -> dict:
         ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
     t0 = time.monotonic()
     out: dict = {}
+    # An API check (1.2.4): method, headers - incl. the Authorization the
+    # platform puts in for THIS run only (never stored here) - and a body.
+    headers = {"User-Agent": "proseth-aiops-collector", **{str(k): str(v) for k, v in (c.get("headers") or {}).items()}}
+    data = c.get("body")
+    method = str(c.get("method") or ("POST" if data else "GET")).upper()
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "proseth-aiops-collector"})
+        req = urllib.request.Request(url, headers=headers, method=method,
+                                     data=data.encode() if isinstance(data, str) and data else None)
         with urllib.request.urlopen(req, timeout=float(c.get("timeout") or 10), context=ctx) as r:
             status = r.status
             body = r.read(65536).decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        status, body = exc.code, ""
+        status = exc.code
+        try:
+            body = exc.read(65536).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            body = ""
     except (urllib.error.URLError, OSError, ssl.SSLError) as exc:
         return {"ok": False, "message": f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"[:300]}
     out["value"] = round((time.monotonic() - t0) * 1000)
@@ -494,7 +504,43 @@ def _check_snmp_if(c: dict) -> dict:
     return {**out, "ok": True, "value": len(idx), "message": f"{len(idx)} interface(s) up"}
 
 
-_CHECKS = {"ping": _check_ping, "tcp": _check_tcp, "http": _check_http, "snmp_if": _check_snmp_if}
+def _ping_series(target: str, count: int) -> dict:
+    """`count` pings 0.2 s apart: loss %, average latency, jitter (mdev)."""
+    import re  # noqa: PLC0415
+    try:
+        r = subprocess.run(["ping", "-n", "-c", str(count), "-i", "0.2", "-W", "2", target],
+                           capture_output=True, text=True, timeout=count * 2 + 10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"target": target, "loss": 100.0, "error": str(exc)}
+    m = re.search(r"([\d.]+)% packet loss", r.stdout)
+    loss = float(m.group(1)) if m else 100.0
+    rtt = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", r.stdout)
+    out = {"target": target, "loss": loss}
+    if rtt:
+        out.update(latency=float(rtt.group(2)), jitter=float(rtt.group(4)))
+    return out
+
+
+def _check_link(c: dict) -> dict:
+    """An INTERNET / WAN LINK: several pings to several targets (an ISP's own
+    gateway, 1.1.1.1, 8.8.8.8 ...). One public target flaps on its own, so the
+    link is judged on its BEST target: down only when NONE answers; latency,
+    jitter and loss are the best target's."""
+    targets = [t for t in (c.get("targets") or []) if t][:4] or [c.get("target")]
+    count = max(3, min(20, int(c.get("count") or 10)))
+    series = [_ping_series(t, count) for t in targets if t]
+    alive = [s for s in series if s.get("loss", 100) < 100]
+    if not alive:
+        return {"ok": False, "message": "no reply from " + ", ".join(s["target"] for s in series),
+                "loss": 100.0, "targets": series}
+    best = min(alive, key=lambda s: (s["loss"], s.get("latency", 1e9)))
+    return {"ok": True, "value": best.get("latency"), "loss": best["loss"], "jitter": best.get("jitter"),
+            "message": f"{best['target']}: {best.get('latency', 0):.1f} ms, loss {best['loss']:.0f}%, "
+                       f"jitter {best.get('jitter', 0):.1f} ms", "targets": series}
+
+
+_CHECKS = {"ping": _check_ping, "tcp": _check_tcp, "http": _check_http, "snmp_if": _check_snmp_if,
+           "link": _check_link}
 
 
 def run_checks(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
