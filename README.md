@@ -116,6 +116,32 @@ sudo rm -rf /opt/proseth-aiops-agent /etc/proseth-aiops-agent /var/lib/proseth-a
 sudo userdel proseth-aiops
 ```
 
+## The servers it watches (forward.sh)
+
+A monitored Linux server needs **no agent** — only its own rsyslog pointed at
+the collector. `forward.sh` does that on any distro, and can get a server
+**ready before the customer has AIOps**:
+
+```bash
+RAW=https://raw.githubusercontent.com/prosethsolutionsAI/proseth-aiops-agent/main
+curl -fsSL $RAW/forward.sh | sudo sh -s -- --prepare                    # ready, sends nothing
+sudo proseth-aiops-forward --collector 203.0.113.10 --level warning      # turn on later - no internet needed
+sudo proseth-aiops-forward --status                                       # OFF / READY / ON, and where
+sudo proseth-aiops-forward --remove                                       # stop sending, stay ready
+sudo proseth-aiops-forward --update                                       # refresh the kept script (settings unchanged)
+sudo proseth-aiops-forward --uninstall                                    # remove everything it added
+```
+
+Or in one go: `curl -fsSL $RAW/forward.sh | sudo sh -s -- --collector 203.0.113.10`.
+Windows servers need nothing: the collector reads their events over WinRM.
+
+**With the PSCyber (Wazuh) agent on the same server:** no conflict. AIOps adds
+one rsyslog file (`/etc/rsyslog.d/90-proseth-aiops.conf`) and sends TCP 514 to
+the AIOps collector; the Wazuh agent sends TCP 1514/1515 to the PSCyber
+collector. Either can be prepared first and turned on later, in either order.
+The two **collectors** must be separate machines — both receive syslog on 514
+and traps on 162.
+
 ## Licence
 
 MIT.
