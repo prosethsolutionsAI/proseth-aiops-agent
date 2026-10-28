@@ -104,6 +104,10 @@ if [ "$PREPARE" = 1 ]; then
   have_logger || install_rsyslog
   install_helper
   [ -x "$HELPER" ] || die "could not install $HELPER"
+  if [ -f "$CONF" ] || [ -f "$NGCONF" ]; then
+    echo "Already sending to a collector - nothing changed; the script is kept as proseth-aiops-forward."
+    "$HELPER" --status; exit 0
+  fi
   echo "READY: this server can send its logs to Proseth AIOps, but sends NOTHING yet."
   echo "  Turn on later (no internet needed):  sudo proseth-aiops-forward --collector <COLLECTOR_IP> [--level warning]"
   echo "  Check:                               sudo proseth-aiops-forward --status"
