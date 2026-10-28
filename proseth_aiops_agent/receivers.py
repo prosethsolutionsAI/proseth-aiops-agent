@@ -15,7 +15,6 @@ import json
 import logging
 import socketserver
 import threading
-from collections import Counter
 from pathlib import Path
 
 from . import rules, snmp
@@ -25,25 +24,63 @@ log = logging.getLogger("proseth-aiops-agent")
 
 
 class Filter:
-    """Rules + gate + counters. Thread-safe; rules are swapped atomically."""
+    """Gate 1 on the collector: the shared rules.Engine (rules, thresholds,
+    recovery, dedup, per-rule counters) plus the queue to the platform.
+    Thread-safe; a new rule set replaces the engine's rules but KEEPS its
+    counters, threshold windows and dedup memory - a rule edit must not make
+    every open threshold start again or every recent alert repeat."""
 
-    def __init__(self, queue: AlertQueue, on_new, cache: Path):
+    TICK_S = 30                                     # watchdog check interval
+
+    def __init__(self, queue: AlertQueue, on_new, cache: Path, *, ticker: bool = True):
         self.queue, self.on_new, self.cache = queue, on_new, cache
+        self.watch_file = cache.with_name("watch.json")
         self._lock = threading.Lock()
-        self._compiled = []
-        self.gate = rules.Gate()
-        self.stats: Counter = Counter()
+        self.engine = rules.Engine()
         try:                                       # last rules survive a restart
             self.set_rules(json.loads(cache.read_text(encoding="utf-8")), persist=False)
         except (OSError, ValueError):
             pass
+        try:                                       # ...and which hosts are watched
+            self.engine.watch = json.loads(self.watch_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        if ticker:
+            threading.Thread(target=self._ticker, daemon=True, name="watchdog").start()
+
+    def _ticker(self) -> None:
+        import time  # noqa: PLC0415
+        while True:
+            time.sleep(self.TICK_S)
+            try:
+                self.tick()
+            except Exception:  # noqa: BLE001 - a watchdog must never take the receivers down
+                log.exception("watchdog tick failed")
+
+    def tick(self, now: float | None = None) -> int:
+        """Send 'gone quiet' alerts, and keep the watch list on disk."""
+        with self._lock:
+            out = self.engine.tick(now)
+            state = json.dumps(self.engine.watch)
+        for payload in out:
+            self.queue.put(payload["labels"].get("via", "syslog"), json.dumps(payload), payload["host"])
+        if out:
+            self.on_new()
+        try:
+            self.watch_file.write_text(state, encoding="utf-8")
+            self.watch_file.chmod(0o600)
+        except OSError:
+            pass
+        return len(out)
 
     def set_rules(self, cfg: dict, persist: bool = True) -> None:
         compiled = rules.compile_rules(cfg.get("rules") or [])
         with self._lock:
-            self._compiled = compiled
-            self.gate.window = int(cfg.get("dedup_seconds") or 300)
-            self.gate.per_minute = int(cfg.get("per_host_per_minute") or 20)
+            self.engine.compiled = compiled
+            self.engine.gate.window = int(cfg.get("dedup_seconds") or 300)
+            self.engine.gate.per_minute = int(cfg.get("per_host_per_minute") or 20)
+        if self.store is not None and cfg.get("log_retention_days"):
+            self.store.retention_days = max(1, min(int(cfg["log_retention_days"]), 3650))
         if persist:
             try:
                 self.cache.write_text(json.dumps(cfg), encoding="utf-8")
@@ -52,30 +89,28 @@ class Filter:
                 pass
         log.info("Log rules updated: %s active", len(compiled))
 
+    store = None                                     # logstore.LogStore, set by the agent
+
     def handle(self, ev: rules.Event) -> None:
+        if self.store is not None:                   # every line is KEPT here, whatever
+            self.store.write(ev)                     # the rules decide to send
         with self._lock:
-            compiled = self._compiled
-        d = rules.evaluate(compiled, ev)
-        self.stats[f"{ev.source}_received"] += 1
-        if d.action != "alert":
-            self.stats[f"{ev.source}_dropped"] += 1
-            return
+            out = self.engine.process_all(ev)
+        for payload in out:
+            self.queue.put(ev.source, json.dumps(payload), ev.host)
+        if out:
+            self.on_new()
+
+    def count(self, what: str) -> None:
         with self._lock:
-            ok = self.gate.allow(ev.host, d.alertname)
-        if not ok:
-            self.stats[f"{ev.source}_suppressed"] += 1
-            return
-        self.stats[f"{ev.source}_forwarded"] += 1
-        payload = {"host": ev.host, "title": d.title, "severity": d.severity,
-                   "alertname": d.alertname, "status": "firing",
-                   "description": ev.message[:3000],
-                   "labels": {"rule": d.rule, "via": ev.source,
-                              **{k: str(v) for k, v in ev.fields.items() if v is not None}}}
-        self.queue.put(ev.source, json.dumps(payload), ev.host)
-        self.on_new()
+            self.engine._count(what)              # noqa: SLF001 - the engine's own tally
 
     def snapshot(self) -> dict:
-        return dict(self.stats)
+        with self._lock:
+            out = dict(self.engine.stats)
+            # Per rule: hits / sent / last - the platform shows noisy and dead rules.
+            out["rules"] = {k: dict(v) for k, v in self.engine.rule_stats.items()}
+        return out
 
 
 def _syslog_udp(filt: Filter):
@@ -109,11 +144,11 @@ def _trap_udp(filt: Filter, communities: set[str]):
             try:
                 d = snmp.decode_trap(self.request[0])
             except snmp.BerError as exc:
-                filt.stats["trap_undecodable"] += 1
+                filt.count("trap_undecodable")
                 log.warning("Trap from %s not decoded: %s", sender, exc)
                 return
             if communities and d["community"] not in communities:
-                filt.stats["trap_wrong_community"] += 1
+                filt.count("trap_wrong_community")
                 return
             filt.handle(rules.Event(source="trap", host=sender, message=snmp.trap_text(d),
                                     fields={"trap": d["trap"], "snmp": d["version"]}))

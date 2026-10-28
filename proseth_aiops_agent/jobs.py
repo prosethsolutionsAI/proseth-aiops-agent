@@ -516,5 +516,11 @@ def run_checks(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
     return {"ok": True, "results": results}
 
 
+def run_logsearch(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:
+    from .logstore import run_logsearch as _search  # noqa: PLC0415
+    return _search(payload, emit, should_stop)
+
+
 HANDLERS = {"shell": run_shell, "ssh": run_ssh, "winrm": run_winrm,
-            "netmiko": run_netmiko, "probe": run_probe, "checks": run_checks}
+            "netmiko": run_netmiko, "probe": run_probe, "checks": run_checks,
+            "logsearch": run_logsearch}

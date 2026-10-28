@@ -50,7 +50,8 @@ JOB_NETMIKO = "netmiko"    # read-only CLI on a network device
 JOB_PROBE = "probe"        # connect + facts
 JOB_SHELL = "shell"        # on the collector itself
 JOB_CHECKS = "checks"      # a batch of ping / tcp / http / snmp_if checks (agent 1.1.0+)
-JOB_KINDS = (JOB_SSH, JOB_WINRM, JOB_NETMIKO, JOB_PROBE, JOB_SHELL, JOB_CHECKS)
+JOB_LOGSEARCH = "logsearch"  # search the raw logs the collector keeps (agent 1.2.0+)
+JOB_KINDS = (JOB_SSH, JOB_WINRM, JOB_NETMIKO, JOB_PROBE, JOB_SHELL, JOB_CHECKS, JOB_LOGSEARCH)
 
 
 def frame(frame_type: str, /, **fields: Any) -> str:

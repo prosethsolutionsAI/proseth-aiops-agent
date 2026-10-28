@@ -17,14 +17,16 @@ import logging
 import os
 import signal
 import sys
+import threading
+import time
 from pathlib import Path
 
-from . import alerts, facts, protocol, receivers
+from . import alerts, facts, logstore, protocol, receivers
 from .jobs import EXECUTOR, HANDLERS
 
 # The ONE place the version is written. The installer reads it with sed and it
 # goes up in HELLO. Bump it when the agent or installer changes.
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 CONFIG_PATH = Path(os.environ.get("AIOPS_AGENT_CONFIG",
                                   "/etc/proseth-aiops-agent/config.json"))
@@ -122,9 +124,27 @@ class Agent:
                 log.error("Webhook listener could not start on :%s (%s)", self.alert_port, exc)
         if self.syslog_port or self.trap_port:
             self.filter = receivers.Filter(self.alert_queue, wake, STATE_DIR / "rules.json")
+            # Every received line is KEPT at the site (90 days, oldest first when
+            # the disk is short); the platform can search it on demand.
+            try:
+                logstore.STORE = logstore.LogStore(STATE_DIR / "logs")
+                self.filter.store = logstore.STORE
+                threading.Thread(target=self._housekeep, daemon=True, name="logstore").start()
+            except OSError as exc:
+                log.error("Raw log store unavailable (%s) - alerting continues without it", exc)
             receivers.start(self.filter, syslog_port=self.syslog_port or None,
                             trap_port=self.trap_port or None,
                             communities=self.trap_communities)
+
+    @staticmethod
+    def _housekeep() -> None:
+        while True:
+            time.sleep(3600)
+            try:
+                if logstore.STORE is not None:
+                    logstore.STORE.housekeep()
+            except Exception:  # noqa: BLE001 - housekeeping must never stop the agent
+                log.exception("log store housekeeping failed")
 
     async def relay_alerts(self) -> None:
         q = self.alert_queue
@@ -238,6 +258,8 @@ class Agent:
         out["listening"] = {"webhook": bool(self.alert_secret), "syslog": self.syslog_port,
                             "trap": self.trap_port}
         out["queued"] = self.alert_queue.depth() if self.alert_queue is not None else 0
+        if logstore.STORE is not None:
+            out["logstore"] = logstore.STORE.stats()
         return out
 
     async def send(self, kind: str, **fields) -> bool:
