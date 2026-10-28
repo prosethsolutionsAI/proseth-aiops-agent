@@ -74,6 +74,7 @@ class Filter:
         return len(out)
 
     def set_rules(self, cfg: dict, persist: bool = True) -> None:
+        self.cfg = cfg                               # re-applied when the store attaches
         compiled = rules.compile_rules(cfg.get("rules") or [])
         with self._lock:
             self.engine.compiled = compiled
@@ -89,7 +90,15 @@ class Filter:
                 pass
         log.info("Log rules updated: %s active", len(compiled))
 
-    store = None                                     # logstore.LogStore, set by the agent
+    store = None                                     # logstore.LogStore, set by attach_store
+    cfg: dict = {}
+
+    def attach_store(self, store) -> None:
+        """The raw-log store, with the retention from the CACHED config applied -
+        set_rules ran at start-up before the store existed, so it fell back to 90."""
+        self.store = store
+        if self.cfg.get("log_retention_days"):
+            store.retention_days = max(1, min(int(self.cfg["log_retention_days"]), 3650))
 
     def handle(self, ev: rules.Event) -> None:
         if self.store is not None:                   # every line is KEPT here, whatever

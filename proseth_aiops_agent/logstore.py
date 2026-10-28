@@ -132,7 +132,8 @@ class LogStore:
                         "oldest": files[0][0] if files else "", "newest": files[-1][0] if files else ""}
         except OSError:
             live = {}
-        return {**self._stats, **live, "written": self.written}
+        return {**self._stats, **live, "written": self.written,
+                "retention_days": self.retention_days}       # as set NOW, not at housekeeping
 
     # ----------------------------------------------------------------- search
     def search(self, q: dict, should_stop=lambda: False) -> dict:
