@@ -121,7 +121,18 @@ class LogStore:
         return self._stats
 
     def stats(self) -> dict:
-        return {**self._stats, "written": self.written}
+        """Live (each heartbeat): days and size on disk now - not as of the last
+        hourly housekeeping, which showed "0 days, 0 bytes" after 110 lines."""
+        try:
+            with self._lock:
+                if self._fh is not None:
+                    self._fh.flush()
+                files = self._days()
+                live = {"days": len(files), "bytes": sum(p.stat().st_size for _, p in files),
+                        "oldest": files[0][0] if files else "", "newest": files[-1][0] if files else ""}
+        except OSError:
+            live = {}
+        return {**self._stats, **live, "written": self.written}
 
     # ----------------------------------------------------------------- search
     def search(self, q: dict, should_stop=lambda: False) -> dict:
