@@ -116,6 +116,26 @@ sudo rm -rf /opt/proseth-aiops-agent /etc/proseth-aiops-agent /var/lib/proseth-a
 sudo userdel proseth-aiops
 ```
 
+## One installer for every Proseth product (proseth-prepare)
+
+Run once on each server. It asks which product the customer uses **now** (Proseth
+AIOps, PSCyber Agentic SOC, both, or none yet), switches that on, and installs
+the others **ready** - sending nothing, enrolled nowhere.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/prosethsolutionsAI/proseth-aiops-agent/main/proseth-prepare.sh | sudo bash
+# no questions:  ... | sudo bash -s -- --now both --aiops-collector 203.0.113.10 --agentic-collector 203.0.113.20 --group Acme
+
+sudo proseth-ready status                                        # what is ON / READY
+sudo proseth-ready aiops   --collector 203.0.113.10              # later, no internet needed
+sudo proseth-ready agentic --collector 203.0.113.20 --group Acme
+sudo proseth-ready uninstall                                     # everything
+```
+
+Windows (PowerShell as Administrator): `proseth-prepare.ps1`, same question
+(`-Now aiops|agentic|both|none`, `-Uninstall`). The same two files are in the
+`pscyber-site-onboarding` repository.
+
 ## The servers it watches (forward.sh)
 
 A monitored Linux server needs **no agent** — only its own rsyslog pointed at
