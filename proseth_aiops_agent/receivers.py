@@ -100,10 +100,34 @@ class Filter:
         if self.cfg.get("log_retention_days"):
             store.retention_days = max(1, min(int(self.cfg["log_retention_days"]), 3650))
 
+    senders: dict = {}
+    SENDERS_SHOWN_S = 48 * 3600                      # reported; the platform shows 24 h
+
+    def _seen(self, ev: rules.Event) -> None:
+        """Who is sending: per host, last line, count, and what kind. Feeds the
+        customer's "Log sources" tab - which devices are actually logging here."""
+        import time  # noqa: PLC0415
+        now = time.time()
+        if not self.senders:
+            self.senders = {}
+        s = self.senders.get(ev.host)
+        if s is None:
+            if len(self.senders) >= 2000:            # bounded: forget the quietest
+                for h in sorted(self.senders, key=lambda k: self.senders[k]["last"])[:200]:
+                    self.senders.pop(h, None)
+            s = self.senders[ev.host] = {"first": int(now), "last": 0, "count": 0,
+                                          "sources": [], "programs": []}
+        s["last"], s["count"] = int(now), s["count"] + 1
+        if ev.source not in s["sources"]:
+            s["sources"].append(ev.source)
+        if ev.program and ev.program not in s["programs"] and len(s["programs"]) < 8:
+            s["programs"].append(ev.program)
+
     def handle(self, ev: rules.Event) -> None:
         if self.store is not None:                   # every line is KEPT here, whatever
             self.store.write(ev)                     # the rules decide to send
         with self._lock:
+            self._seen(ev)
             out = self.engine.process_all(ev)
         for payload in out:
             self.queue.put(ev.source, json.dumps(payload), ev.host)
@@ -119,6 +143,12 @@ class Filter:
             out = dict(self.engine.stats)
             # Per rule: hits / sent / last - the platform shows noisy and dead rules.
             out["rules"] = {k: dict(v) for k, v in self.engine.rule_stats.items()}
+            import time  # noqa: PLC0415
+            cutoff = time.time() - self.SENDERS_SHOWN_S
+            out["senders"] = {h: {**v, "sources": list(v["sources"]), "programs": list(v["programs"])}
+                              for h, v in sorted((self.senders or {}).items(),
+                                                 key=lambda kv: -kv[1]["last"])[:500]
+                              if v["last"] >= cutoff}
         return out
 
 
