@@ -10,7 +10,8 @@
 #
 # Without questions (all optional; anything missing is asked for):
 #   --now aiops|agentic|both|none        the product(s) to switch on now
-#   --aiops-collector IP  [--level L]    Proseth AIOps collector (level default warning)
+#   --aiops-collector IP  [--level L]    Proseth AIOps collector; L = crit|err|warning|notice|info
+#                                        (asked when AIOps is switched on; default warning)
 #   --agentic-collector IP --group G     PSCyber Agentic SOC site collector and agent group
 #                                        (the enrolment password is asked, or PSCYBER_ENROLL_PASSWORD)
 #
@@ -32,7 +33,7 @@ set -uo pipefail
 AIOPS_URL="https://raw.githubusercontent.com/prosethsolutionsAI/proseth-aiops-agent/main/forward.sh"
 AGENTIC_URL="https://raw.githubusercontent.com/prosethsolutionsAI/pscyber-site-onboarding/main/agents/install-agent-linux.sh"
 WRAPPER=/usr/local/sbin/proseth-ready
-NOW=""; AIOPS_IP=""; LEVEL=warning; AGENTIC_IP=""; GROUP=""
+NOW=""; AIOPS_IP=""; LEVEL=""; AGENTIC_IP=""; GROUP=""
 
 die() { echo "proseth-prepare: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
@@ -68,6 +69,17 @@ fi
 case "$NOW" in aiops|agentic|both|none) ;; *) die "--now must be aiops, agentic, both or none" ;; esac
 on() { [ "$NOW" = both ] || [ "$NOW" = "$1" ]; }
 if on aiops && [ -z "$AIOPS_IP" ]; then ask "Proseth AIOps collector IP" AIOPS_IP; fi
+if on aiops && [ -z "$LEVEL" ]; then
+  if [ -r /dev/tty ] && { true </dev/tty; } 2>/dev/null; then
+    echo "Which logs should this server send to AIOps? (security logs - logins, sudo - are always sent)"
+    echo "  1) critical only        2) errors and worse"
+    echo "  3) warnings and worse (recommended)"
+    echo "  4) notices and worse    5) everything (info)"
+    lv=""; read -r -p "  Choose 1-5 [3]: " lv </dev/tty
+    case "${lv:-3}" in 1) LEVEL=crit ;; 2) LEVEL=err ;; 3) LEVEL=warning ;; 4) LEVEL=notice ;; 5) LEVEL=info ;; *) die "choose 1-5" ;; esac
+  else LEVEL=warning; fi   # no terminal: the recommended level
+fi
+[ -n "$LEVEL" ] || LEVEL=warning
 if on agentic; then
   [ -n "$AGENTIC_IP" ] || ask "PSCyber Agentic site collector IP" AGENTIC_IP
   [ -n "$GROUP" ] || ask "PSCyber agent group (the customer's Onboarding tab shows it)" GROUP
