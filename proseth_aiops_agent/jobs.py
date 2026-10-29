@@ -504,6 +504,200 @@ def _check_snmp_if(c: dict) -> dict:
     return {**out, "ok": True, "value": len(idx), "message": f"{len(idx)} interface(s) up"}
 
 
+# --- full SNMP poll of a network device (1.2.5) ------------------------------------
+# Ported from the PSCyber collector's poller, on this agent's own BER code (no
+# net-snmp needed at the site): system info, CPU / memory per vendor, and every
+# interface's state, speed, counters and errors. The platform works out rates.
+
+_IF_STATUS = {"1": "up", "2": "down", "3": "testing", "5": "dormant", "6": "notPresent", "7": "lowerLayerDown"}
+
+
+def _num(v):
+    try:
+        return float(str(v).split()[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _avg(vals) -> float | None:
+    xs = [x for x in (_num(v) for v in vals) if x is not None]
+    return round(sum(xs) / len(xs), 1) if xs else None
+
+
+def _snmp_family(oid: str, mib: str) -> str:
+    if mib and mib != "auto":
+        return mib
+    for prefix, fam in (("1.3.6.1.4.1.12356.106.", "fortiswitch"), ("1.3.6.1.4.1.12356.", "fortigate"),
+                        ("1.3.6.1.4.1.9.", "cisco"), ("1.3.6.1.4.1.2636.", "juniper"),
+                        ("1.3.6.1.4.1.25461.", "paloalto"), ("1.3.6.1.4.1.2011.", "huawei")):
+        if oid.startswith(prefix):
+            return fam
+    return "standard"
+
+
+def _snmp_vendor(G, W, oid: str, mib: str) -> dict:
+    """CPU / memory / disk / sessions: the vendor's own MIB first, then the standard ones."""
+    out: dict = {"sources": {}}
+    fam = _snmp_family(oid, mib)
+    out["family"] = fam
+
+    def fortiswitch():
+        b = "1.3.6.1.4.1.12356.106.4.1."
+        g = G([b + "2.0", b + "3.0", b + "4.0", b + "5.0", b + "6.0"])
+        cpu, mem, cap = _num(g.get(b + "2.0")), _num(g.get(b + "3.0")), _num(g.get(b + "4.0"))
+        if cpu is not None:
+            out["cpu"], out["sources"]["cpu"] = cpu, "FORTINET-FORTISWITCH-MIB"
+        if mem is not None:
+            out["mem"] = mem if mem <= 100 else (round(100 * mem / cap, 1) if cap else None)
+            if cap:
+                out["mem_total"] = int(cap) * 1024
+        used, dcap = _num(g.get(b + "5.0")), _num(g.get(b + "6.0"))
+        if used is not None and dcap:
+            out["disk"] = round(100 * used / dcap, 1)
+
+    if fam == "fortiswitch":
+        fortiswitch()
+    elif fam == "huawei":
+        cpu = [x for x in (_num(v) for v in W("1.3.6.1.4.1.2011.5.25.31.1.1.1.1.5").values()) if x]
+        mem = [x for x in (_num(v) for v in W("1.3.6.1.4.1.2011.5.25.31.1.1.1.1.7").values()) if x]
+        if cpu:
+            out["cpu"], out["sources"]["cpu"] = max(cpu), "HUAWEI-ENTITY-EXTENT-MIB"
+        if mem:
+            out["mem"], out["sources"]["mem"] = max(mem), "HUAWEI-ENTITY-EXTENT-MIB"
+    elif fam == "fortigate":
+        b = "1.3.6.1.4.1.12356.101.4.1."
+        g = G([b + "3.0", b + "4.0", b + "5.0", b + "6.0", b + "7.0", b + "8.0", b + "1.0", "1.3.6.1.4.1.12356.100.1.1.1.0"])
+        cpu, mem = _num(g.get(b + "3.0")), _num(g.get(b + "4.0"))
+        if cpu is not None:
+            out["cpu"], out["sources"]["cpu"] = cpu, "FORTINET-FORTIGATE-MIB"
+        if mem is not None:
+            out["mem"], out["sources"]["mem"] = mem, "FORTINET-FORTIGATE-MIB"
+            if _num(g.get(b + "5.0")):
+                out["mem_total"] = int(_num(g[b + "5.0"])) * 1024
+        used, cap = _num(g.get(b + "6.0")), _num(g.get(b + "7.0"))
+        if used is not None and cap:
+            out["disk"] = round(100 * used / cap, 1)
+        if _num(g.get(b + "8.0")) is not None:
+            out["sessions"] = int(_num(g[b + "8.0"]))
+        out["firmware"] = g.get(b + "1.0") or None
+        out["serial"] = g.get("1.3.6.1.4.1.12356.100.1.1.1.0") or None
+        if out.get("cpu") is None and out.get("mem") is None:
+            fortiswitch()
+    elif fam == "cisco":
+        cpu = _avg(W("1.3.6.1.4.1.9.9.109.1.1.1.1.8").values()) or _avg(W("1.3.6.1.4.1.9.9.109.1.1.1.1.5").values())
+        if cpu is not None:
+            out["cpu"], out["sources"]["cpu"] = cpu, "CISCO-PROCESS-MIB"
+        used, free = W("1.3.6.1.4.1.9.9.48.1.1.1.5"), W("1.3.6.1.4.1.9.9.48.1.1.1.6")
+        u, f_ = _num(used.get("1")), _num(free.get("1"))
+        if u is not None and f_ is not None and u + f_ > 0:
+            out["mem"], out["sources"]["mem"] = round(100 * u / (u + f_), 1), "CISCO-MEMORY-POOL-MIB"
+            out["mem_total"] = int(u + f_)
+    elif fam == "juniper":
+        cpu = [x for x in (_num(v) for v in W("1.3.6.1.4.1.2636.3.1.13.1.8").values()) if x]
+        buf = [x for x in (_num(v) for v in W("1.3.6.1.4.1.2636.3.1.13.1.11").values()) if x]
+        if cpu:
+            out["cpu"], out["sources"]["cpu"] = max(cpu), "JUNIPER-MIB"
+        if buf:
+            out["mem"], out["sources"]["mem"] = max(buf), "JUNIPER-MIB"
+    elif fam == "paloalto":
+        g = G(["1.3.6.1.4.1.25461.2.1.2.3.3.0"])
+        if _num(g.get("1.3.6.1.4.1.25461.2.1.2.3.3.0")) is not None:
+            out["sessions"] = int(_num(g["1.3.6.1.4.1.25461.2.1.2.3.3.0"]))
+    if out.get("cpu") is None:                         # standard: HOST-RESOURCES, then UCD (Linux)
+        loads = W("1.3.6.1.2.1.25.3.3.1.2")
+        cpu = _avg(loads.values())
+        if loads:
+            out["cpu_cores"] = len(loads)
+        if cpu is None:
+            idle = _num(G(["1.3.6.1.4.1.2021.11.11.0"]).get("1.3.6.1.4.1.2021.11.11.0"))
+            if idle is not None:
+                cpu, out["sources"]["cpu"] = round(100 - idle, 1), "UCD-SNMP-MIB"
+        else:
+            out["sources"]["cpu"] = "HOST-RESOURCES-MIB"
+        out["cpu"] = cpu
+    if out.get("mem") is None:
+        u = G(["1.3.6.1.4.1.2021.4.5.0", "1.3.6.1.4.1.2021.4.6.0", "1.3.6.1.4.1.2021.4.14.0", "1.3.6.1.4.1.2021.4.15.0"])
+        total = _num(u.get("1.3.6.1.4.1.2021.4.5.0"))
+        if total:                                      # Linux: used = total - free - buffers - cache
+            used = total - sum(_num(u.get(k)) or 0 for k in ("1.3.6.1.4.1.2021.4.6.0", "1.3.6.1.4.1.2021.4.14.0", "1.3.6.1.4.1.2021.4.15.0"))
+            out["mem"], out["sources"]["mem"] = round(100 * max(0.0, used) / total, 1), "UCD-SNMP-MIB"
+            out["mem_total"] = int(total) * 1024
+        else:
+            st = W("1.3.6.1.2.1.25.2.3.1")
+            for idx in {k.split(".", 1)[1] for k in st if k.startswith("2.")}:
+                if st.get(f"2.{idx}") == "1.3.6.1.2.1.25.2.1.2":   # hrStorageRam
+                    size, used, unit = _num(st.get(f"5.{idx}")), _num(st.get(f"6.{idx}")), _num(st.get(f"4.{idx}")) or 1
+                    if size:
+                        out["mem"], out["sources"]["mem"] = round(100 * (used or 0) / size, 1), "HOST-RESOURCES-MIB"
+                        out["mem_total"] = int(size * unit)
+                    break
+    return out
+
+
+def _snmp_interfaces(W, limit: int = 512) -> list:
+    t, x = W("1.3.6.1.2.1.2.2.1"), W("1.3.6.1.2.1.31.1.1.1")
+    idxs = sorted({int(k.split(".", 1)[1]) for k in t if k.startswith("2.") and k.split(".", 1)[1].isdigit()})[:limit]
+    out = []
+    for i in idxs:
+        hc_in, hc_out = x.get(f"6.{i}"), x.get(f"10.{i}")
+        hc = hc_in is not None and hc_out is not None
+        high = _num(x.get(f"15.{i}"))
+        speed = int(high) if high else (int(_num(t.get(f"5.{i}")) or 0) // 1_000_000) or None
+
+        def iv(v):
+            n = _num(v)
+            return int(n) if n is not None else None
+        out.append({"i": i, "name": x.get(f"1.{i}") or t.get(f"2.{i}") or f"if{i}", "alias": x.get(f"18.{i}") or "",
+                    "speed_mbps": speed, "admin": _IF_STATUS.get(t.get(f"7.{i}", ""), t.get(f"7.{i}", "")),
+                    "oper": _IF_STATUS.get(t.get(f"8.{i}", ""), t.get(f"8.{i}", "")), "hc": hc,
+                    "in": iv(hc_in if hc else t.get(f"10.{i}")), "out": iv(hc_out if hc else t.get(f"16.{i}")),
+                    "in_err": iv(t.get(f"14.{i}")), "out_err": iv(t.get(f"20.{i}")), "in_disc": iv(t.get(f"13.{i}"))})
+    return out
+
+
+def _check_snmp_poll(c: dict) -> dict:
+    """The whole device: sysDescr/Name/Location/uptime, vendor CPU and memory, every interface."""
+    from . import snmp  # noqa: PLC0415
+    host, com = c["target"], c.get("community") or "public"
+    port, to = int(c.get("port") or 161), float(c.get("timeout") or 2)
+
+    def G(oids):
+        try:
+            return snmp.get_raw(host, com, oids, port=port, timeout=to)
+        except Exception:  # noqa: BLE001 - one missing table must not fail the poll
+            return {}
+
+    def W(base):
+        try:
+            return snmp.walk(host, com, base, port=port, timeout=to)
+        except Exception:  # noqa: BLE001
+            return {}
+    sysd = {"descr": "1.3.6.1.2.1.1.1.0", "object_id": "1.3.6.1.2.1.1.2.0", "uptime": "1.3.6.1.2.1.1.3.0",
+            "name": "1.3.6.1.2.1.1.5.0", "location": "1.3.6.1.2.1.1.6.0"}
+    try:
+        g = snmp.get_raw(host, com, list(sysd.values()), port=port, timeout=to)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"SNMP did not answer ({type(exc).__name__}) - check SNMP is on for this "
+                                        "collector's address, the community matches and UDP 161 is open"}
+    if not g:
+        return {"ok": False, "message": "the device answered with no system information"}
+    s = {k: g.get(v) for k, v in sysd.items()}
+    up = _num(s["uptime"])
+    res = {"ok": True, "sys": {"descr": (s["descr"] or "")[:300], "object_id": s["object_id"] or "",
+                               "name": s["name"] or "", "location": s["location"] or ""},
+           "uptime_s": int(up) // 100 if up is not None else None}
+    res.update(_snmp_vendor(G, W, s["object_id"] or "", c.get("mib") or "auto"))
+    res["ifaces"] = _snmp_interfaces(W)
+    watch = set(c.get("watch") or [])
+    down = [f["name"] for f in res["ifaces"] if f["name"] in watch and f["admin"] == "up" and f["oper"] != "up"]
+    upn = sum(1 for f in res["ifaces"] if f["oper"] == "up")
+    res["value"] = upn
+    res["message"] = (f"watched interface(s) down: {', '.join(down)}" if down
+                      else f"{upn}/{len(res['ifaces'])} interfaces up")
+    res["watch_down"] = down
+    return res
+
+
 def _ping_series(target: str, count: int) -> dict:
     """`count` pings 0.2 s apart: loss %, average latency, jitter (mdev)."""
     import re  # noqa: PLC0415
@@ -540,7 +734,7 @@ def _check_link(c: dict) -> dict:
 
 
 _CHECKS = {"ping": _check_ping, "tcp": _check_tcp, "http": _check_http, "snmp_if": _check_snmp_if,
-           "link": _check_link}
+           "link": _check_link, "snmp_poll": _check_snmp_poll}
 
 
 def run_checks(payload: dict, emit: Emit, should_stop: ShouldStop) -> dict:

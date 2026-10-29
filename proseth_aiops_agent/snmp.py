@@ -173,6 +173,66 @@ def _enc_oid(oid: str) -> bytes:
     return _tlv(0x06, bytes(out))
 
 
+def _request(host: str, community: str, tag: int, oids: list[str], port: int, timeout: float,
+             non_rep: int = 0, max_rep: int = 0, retries: int = 1) -> list[tuple[str, int, str]]:
+    """One v2c request (GET 0xA0 / GETBULK 0xA5). [(oid, value tag, value)]."""
+    rid = random.randint(1, 2**30)
+    vbs = b"".join(_tlv(0x30, _enc_oid(o) + b"\x05\x00") for o in oids)
+    pdu = _tlv(tag, _enc_int(rid) + _enc_int(non_rep) + _enc_int(max_rep) + _tlv(0x30, vbs))
+    msg = _tlv(0x30, _enc_int(1) + _tlv(0x04, community.encode()) + pdu)
+    data = b""
+    for attempt in range(retries + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            try:
+                s.sendto(msg, (host, port))
+                while True:                              # skip a late answer to an earlier try
+                    data, _ = s.recvfrom(65535)
+                    _t, body, _ = _read(data, 0)
+                    resp = _children(_children(body)[2][1])
+                    if int.from_bytes(resp[0][1], "big", signed=True) == rid:
+                        break
+                break
+            except socket.timeout:
+                if attempt == retries:
+                    raise
+    if int.from_bytes(resp[1][1], "big"):
+        raise BerError(f"SNMP error status {int.from_bytes(resp[1][1], 'big')}")
+    out = []
+    for _t, vb in _children(resp[3][1]):
+        kids = _children(vb)
+        if len(kids) == 2 and kids[0][0] == 0x06:
+            vt, vv = kids[1]
+            out.append((_oid(kids[0][1]), vt, _oid(vv) if vt == 0x06 else _value(vt, vv)))
+    return out
+
+
+def walk(host: str, community: str, base: str, port: int = 161, timeout: float = 2.0,
+         max_rows: int = 5000) -> dict[str, str]:
+    """Every value under `base` with GETBULK: {suffix after base: value}. Ends at
+    the subtree's end, endOfMibView, or max_rows (a runaway agent cannot loop us)."""
+    out: dict[str, str] = {}
+    cur = base
+    while len(out) < max_rows:
+        rows = _request(host, community, 0xA5, [cur], port, timeout, 0, 30)
+        if not rows:
+            break
+        for oid, vt, val in rows:
+            if vt in (0x80, 0x81, 0x82) or not oid.startswith(base + "."):
+                return out
+            suf = oid[len(base) + 1:]
+            if suf in out:
+                return out                               # not advancing - a broken agent
+            out[suf] = val
+            cur = oid
+    return out
+
+
+def get_raw(host: str, community: str, oids: list[str], port: int = 161, timeout: float = 2.0) -> dict[str, str]:
+    """GET that keeps OID values as OIDs (sysObjectID) and drops noSuch* answers."""
+    return {o: v for o, vt, v in _request(host, community, 0xA0, oids, port, timeout) if vt not in (0x80, 0x81, 0x82)}
+
+
 def get(host: str, community: str, oids: list[str], port: int = 161,
         timeout: float = 3.0) -> dict[str, str]:
     """SNMPv2c GET. {oid: value}. Raises OSError/BerError on failure."""

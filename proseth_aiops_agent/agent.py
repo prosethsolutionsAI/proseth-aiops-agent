@@ -26,7 +26,7 @@ from .jobs import EXECUTOR, HANDLERS
 
 # The ONE place the version is written. The installer reads it with sed and it
 # goes up in HELLO. Bump it when the agent or installer changes.
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
 CONFIG_PATH = Path(os.environ.get("AIOPS_AGENT_CONFIG",
                                   "/etc/proseth-aiops-agent/config.json"))
