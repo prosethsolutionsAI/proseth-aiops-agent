@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -634,6 +635,101 @@ def _snmp_vendor(G, W, oid: str, mib: str) -> dict:
     return out
 
 
+# --- hardware health (1.2.7): temperature, fans, power supplies, modules, UPS ---
+# One shape for every vendor: {kind, name, state ok|warning|critical, value, unit}.
+# Read from the vendor's own environment MIB where it has one, then the standard
+# ENTITY-SENSOR / HOST-RESOURCES / UPS MIBs (ESXi, Linux snmpd, UPS cards). A
+# table the device does not have is simply empty - never a failed poll.
+
+_CISCO_ENV = {"1": "ok", "2": "warning", "3": "critical", "4": "critical", "5": None, "6": "critical"}
+
+
+def _hw_add(out: list, kind: str, name: str, state, value=None, unit: str = "") -> None:
+    if state is None or len(out) >= 64:
+        return
+    out.append({"kind": kind, "name": (name or kind)[:60], "state": state,
+                "value": round(value, 1) if isinstance(value, float) else value, "unit": unit})
+
+
+def _snmp_hardware(W, G, fam: str) -> list:
+    hw: list = []
+
+    def rows(base: str) -> dict[str, dict[str, str]]:
+        """A table walked once, as {index: {column: value}}."""
+        t: dict[str, dict[str, str]] = {}
+        for k, v in W(base).items():
+            col, _, idx = k.partition(".")
+            if idx:
+                t.setdefault(idx, {})[col] = v
+        return t
+    if fam == "cisco":                                          # CISCO-ENVMON-MIB
+        for r in rows("1.3.6.1.4.1.9.9.13.1.3.1").values():
+            _hw_add(hw, "temp", r.get("2", ""), _CISCO_ENV.get(r.get("6", "")), _num(r.get("3")), "°C")
+        for r in rows("1.3.6.1.4.1.9.9.13.1.4.1").values():
+            _hw_add(hw, "fan", r.get("2", ""), _CISCO_ENV.get(r.get("3", "")))
+        for r in rows("1.3.6.1.4.1.9.9.13.1.5.1").values():
+            _hw_add(hw, "psu", r.get("2", ""), _CISCO_ENV.get(r.get("3", "")))
+    elif fam in ("fortigate", "fortiswitch"):                   # FORTINET-FORTIGATE-MIB fgHwSensors
+        for r in rows("1.3.6.1.4.1.12356.101.4.3.2.1").values():
+            nm = r.get("2", "")
+            kind = "fan" if "fan" in nm.lower() else "psu" if re.search(r"ps\d|psu|power", nm, re.I) else "temp" if re.search(r"temp|°|dts|cpu", nm, re.I) else "sensor"
+            _hw_add(hw, kind, nm, "critical" if r.get("4") == "1" else "ok", _num(r.get("3")), "°C" if kind == "temp" else "")
+    elif fam == "juniper":                                      # JUNIPER-MIB jnxOperatingTable
+        for r in rows("1.3.6.1.4.1.2636.3.1.13.1").values():
+            nm, st = r.get("5", ""), r.get("6", "")
+            low = nm.lower()
+            kind = "fan" if "fan" in low else "psu" if "power" in low or "pem" in low or "psu" in low else "module"
+            state = {"2": "ok", "3": "ok", "5": "warning", "6": "critical", "7": "ok", "4": "warning"}.get(st)
+            if kind == "module" and not re.search(r"fpc|routing engine|pic|card|module", low):
+                continue
+            _hw_add(hw, kind, nm, state)
+            t = _num(r.get("7"))
+            if t and kind in ("module",) and t > 0:
+                _hw_add(hw, "temp", nm, "critical" if t >= 75 else "warning" if t >= 65 else "ok", t, "°C")
+    elif fam == "huawei":                                       # HUAWEI-ENTITY-EXTENT-MIB
+        temps = W("1.3.6.1.4.1.2011.5.25.31.1.1.1.1.11")
+        for idx, v in list(temps.items())[:16]:
+            t = _num(v)
+            if t and t > 0:
+                _hw_add(hw, "temp", f"board {idx}", "critical" if t >= 75 else "warning" if t >= 65 else "ok", t, "°C")
+        for idx, v in W("1.3.6.1.4.1.2011.5.25.31.1.1.10.1.7").items():
+            _hw_add(hw, "fan", f"fan {idx}", {"1": "ok", "2": "critical"}.get(v))
+    if not hw:                                                  # ENTITY-SENSOR-MIB (standard)
+        names = {k: v for k, v in W("1.3.6.1.2.1.47.1.1.1.1.7").items()}
+        for idx, r in list(rows("1.3.6.1.2.1.99.1.1.1").items())[:64]:
+            typ, val, scale, prec, op = r.get("1"), _num(r.get("4")), r.get("2"), _num(r.get("3")) or 0, r.get("5")
+            kind = {"8": "temp", "10": "fan", "3": "psu", "4": "psu", "5": "psu", "6": "psu"}.get(typ or "")
+            if kind is None:
+                continue
+            if val is not None and prec:
+                val = val / (10 ** prec)
+            if val is not None and scale == "8":               # milli
+                val = val / 1000
+            state = {"1": "ok", "2": "critical", "3": "critical"}.get(op or "", "ok")
+            if kind == "temp" and state == "ok" and val is not None:
+                state = "critical" if val >= 80 else "warning" if val >= 70 else "ok"
+            _hw_add(hw, kind, names.get(idx, f"sensor {idx}"), state, val, "°C" if kind == "temp" else "rpm" if kind == "fan" else "")
+    if not hw:                                                  # HOST-RESOURCES hrDevice (ESXi, servers)
+        for r in list(rows("1.3.6.1.2.1.25.3.2.1").values())[:48]:
+            st = {"2": "ok", "3": "warning", "5": "critical"}.get(r.get("5", ""))
+            nm = r.get("3", "")
+            if st and st != "ok" or (st == "ok" and re.search(r"power|fan|temp|raid|disk|controller", nm, re.I)):
+                _hw_add(hw, "device", nm, st)
+    # A UPS: UPS-MIB (RFC 1628), then APC PowerNet.
+    ups = G(["1.3.6.1.2.1.33.1.2.1.0", "1.3.6.1.2.1.33.1.2.4.0", "1.3.6.1.2.1.33.1.4.1.0",
+             "1.3.6.1.4.1.318.1.1.1.2.1.1.0", "1.3.6.1.4.1.318.1.1.1.2.2.1.0", "1.3.6.1.4.1.318.1.1.1.4.1.1.0"])
+    bat, charge, src = ups.get("1.3.6.1.2.1.33.1.2.1.0"), _num(ups.get("1.3.6.1.2.1.33.1.2.4.0")), ups.get("1.3.6.1.2.1.33.1.4.1.0")
+    if bat is None and ups.get("1.3.6.1.4.1.318.1.1.1.2.1.1.0") is not None:     # APC: 2 normal, 3 low
+        bat = {"2": "2", "3": "3"}.get(ups.get("1.3.6.1.4.1.318.1.1.1.2.1.1.0"), "1")
+        charge = _num(ups.get("1.3.6.1.4.1.318.1.1.1.2.2.1.0"))
+        src = {"2": "3", "3": "5"}.get(ups.get("1.3.6.1.4.1.318.1.1.1.4.1.1.0") or "", src)
+    if bat is not None:
+        _hw_add(hw, "battery", "UPS battery", {"2": "ok", "3": "warning", "4": "critical"}.get(bat, "warning"), charge, "%")
+    if src is not None:
+        _hw_add(hw, "power", "UPS output", "ok" if src == "3" else "critical" if src == "5" else "warning", None, "")
+    return hw
+
+
 def _snmp_interfaces(W, limit: int = 512) -> list:
     t, x = W("1.3.6.1.2.1.2.2.1"), W("1.3.6.1.2.1.31.1.1.1")
     idxs = sorted({int(k.split(".", 1)[1]) for k in t if k.startswith("2.") and k.split(".", 1)[1].isdigit()})[:limit]
@@ -704,6 +800,10 @@ def _snmp_poll_with(G, W, sess, host, com, port, to, c) -> dict:
                                "name": s["name"] or "", "location": s["location"] or ""},
            "uptime_s": int(up) // 100 if up is not None else None}
     res.update(_snmp_vendor(G, W, s["object_id"] or "", c.get("mib") or "auto"))
+    try:
+        res["hw"] = _snmp_hardware(W, G, res.get("family") or "standard")
+    except Exception:  # noqa: BLE001 - hardware is extra; it must never fail the poll
+        res["hw"] = []
     res["ifaces"] = _snmp_interfaces(W)
     watch = set(c.get("watch") or [])
     down = [f["name"] for f in res["ifaces"] if f["name"] in watch and f["admin"] == "up" and f["oper"] != "up"]
