@@ -657,28 +657,45 @@ def _snmp_interfaces(W, limit: int = 512) -> list:
 
 def _check_snmp_poll(c: dict) -> dict:
     """The whole device: sysDescr/Name/Location/uptime, vendor CPU and memory, every interface."""
-    from . import snmp  # noqa: PLC0415
+    from . import snmp, snmp_cli  # noqa: PLC0415
     host, com = c["target"], c.get("community") or "public"
     port, to = int(c.get("port") or 161), float(c.get("timeout") or 2)
+    v3 = c.get("v3")
+    sess = None
+    if v3:
+        # SNMPv3: net-snmp's tools (privacy needs AES, not in the standard library).
+        if not snmp_cli.available():
+            return {"ok": False, "message": "SNMPv3 needs net-snmp's tools on this collector: run 'sudo apt-get install snmp' "
+                                            "(or re-run the installer)"}
+        sess = snmp_cli.Session(host, port, v3, to)
 
     def G(oids):
         try:
-            return snmp.get_raw(host, com, oids, port=port, timeout=to)
+            return sess.get(oids) if sess else snmp.get_raw(host, com, oids, port=port, timeout=to)
         except Exception:  # noqa: BLE001 - one missing table must not fail the poll
             return {}
 
     def W(base):
         try:
-            return snmp.walk(host, com, base, port=port, timeout=to)
+            return sess.walk(base) if sess else snmp.walk(host, com, base, port=port, timeout=to)
         except Exception:  # noqa: BLE001
             return {}
+    try:
+        return _snmp_poll_with(G, W, sess, host, com, port, to, c)
+    finally:
+        if sess:
+            sess.close()
+
+
+def _snmp_poll_with(G, W, sess, host, com, port, to, c) -> dict:
+    from . import snmp  # noqa: PLC0415
     sysd = {"descr": "1.3.6.1.2.1.1.1.0", "object_id": "1.3.6.1.2.1.1.2.0", "uptime": "1.3.6.1.2.1.1.3.0",
             "name": "1.3.6.1.2.1.1.5.0", "location": "1.3.6.1.2.1.1.6.0"}
     try:
-        g = snmp.get_raw(host, com, list(sysd.values()), port=port, timeout=to)
+        g = sess.get(list(sysd.values())) if sess else snmp.get_raw(host, com, list(sysd.values()), port=port, timeout=to)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "message": f"SNMP did not answer ({type(exc).__name__}) - check SNMP is on for this "
-                                        "collector's address, the community matches and UDP 161 is open"}
+        return {"ok": False, "message": (str(exc) if sess else f"SNMP did not answer ({type(exc).__name__}) - check SNMP is on "
+                                         "for this collector's address, the community matches and UDP 161 is open")}
     if not g:
         return {"ok": False, "message": "the device answered with no system information"}
     s = {k: g.get(v) for k, v in sysd.items()}

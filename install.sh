@@ -126,6 +126,9 @@ apt-get update -qq >/dev/null 2>&1
 apt-get install -y -qq python3 python3-venv python3-pip openssh-client ca-certificates curl >/dev/null 2>&1 \
   || die "Package installation failed. Check this machine can reach the Ubuntu archives."
 ok "base packages"
+# net-snmp's tools: SNMPv3 (auth + privacy) polling. v2c needs nothing - it is built in.
+# Optional: without them only v3 devices wait, and say why.
+if apt-get install -y -qq snmp >/dev/null 2>&1; then ok "SNMP tools (for SNMPv3)"; else warn "SNMP tools not installed - SNMPv3 devices cannot be polled until 'apt-get install snmp'"; fi
 
 resolve_source() {
   local here=""
