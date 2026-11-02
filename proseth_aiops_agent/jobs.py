@@ -730,6 +730,30 @@ def _snmp_hardware(W, G, fam: str) -> list:
     return hw
 
 
+_SKIP_MOUNT = re.compile(r"^/(proc|sys|dev|run|snap)(/|$)|^/boot/efi$|/docker/|/containers/|^Virtual memory|^Physical memory|^Memory buffers|^Cached memory|^Shared memory|^Swap space")
+
+
+def _snmp_storage(W, limit: int = 32) -> list:
+    """Every FIXED DISK in HOST-RESOURCES hrStorageTable (Linux snmpd, Windows,
+    ESXi, vCenter's appliance): mount, size, % used. RAM, swap and pseudo file
+    systems are left out; an empty table is simply no disks."""
+    st = W("1.3.6.1.2.1.25.2.3.1")
+    out = []
+    for idx in sorted({k.split(".", 1)[1] for k in st if k.startswith("2.")}, key=lambda x: int(x) if x.isdigit() else 0):
+        if st.get(f"2.{idx}") != "1.3.6.1.2.1.25.2.1.4":          # hrStorageFixedDisk
+            continue
+        name = (st.get(f"3.{idx}") or "").strip()
+        unit, size, used = _num(st.get(f"4.{idx}")) or 1, _num(st.get(f"5.{idx}")), _num(st.get(f"6.{idx}"))
+        if not name or not size or used is None or _SKIP_MOUNT.search(name):
+            continue
+        if name[1:3] == ":\\":                                         # Windows: 'C:\ Label:...  Serial ...'
+            name = name[:2]
+        out.append({"mount": name[:80], "pct": round(100 * used / size, 1), "total": int(size * unit), "used": int(used * unit)})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _snmp_interfaces(W, limit: int = 512) -> list:
     t, x = W("1.3.6.1.2.1.2.2.1"), W("1.3.6.1.2.1.31.1.1.1")
     idxs = sorted({int(k.split(".", 1)[1]) for k in t if k.startswith("2.") and k.split(".", 1)[1].isdigit()})[:limit]
@@ -804,6 +828,10 @@ def _snmp_poll_with(G, W, sess, host, com, port, to, c) -> dict:
         res["hw"] = _snmp_hardware(W, G, res.get("family") or "standard")
     except Exception:  # noqa: BLE001 - hardware is extra; it must never fail the poll
         res["hw"] = []
+    try:
+        res["disks"] = _snmp_storage(W)
+    except Exception:  # noqa: BLE001 - disks are extra too
+        res["disks"] = []
     res["ifaces"] = _snmp_interfaces(W)
     watch = set(c.get("watch") or [])
     down = [f["name"] for f in res["ifaces"] if f["name"] in watch and f["admin"] == "up" and f["oper"] != "up"]
