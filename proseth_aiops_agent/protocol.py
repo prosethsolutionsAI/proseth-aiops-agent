@@ -42,6 +42,11 @@ WELCOME, PING, JOB, CANCEL, UPGRADE, RESTART, ALERT_ACK, DENIED = (
 # after WELCOME and whenever they change; the agent caches them on disk so it
 # keeps filtering through a platform outage. Carries NO secrets.
 CONFIG = "config"
+# Login lockdown of the collector's own machine (agent 1.3.0+): {"state": "on"|"off",
+# "contact": "..."} - sent when an administrator switches it and after every
+# WELCOME while it is on. The agent answers in its heartbeats: `lockdown` = what
+# the machine really is ({"state", "since", "ssh", "nologin", "root", "error"}).
+LOCKDOWN = "lockdown"
 
 # Job kinds. Each runs INSIDE the customer network.
 JOB_SSH = "ssh"            # a bash script on a Linux host, over SSH

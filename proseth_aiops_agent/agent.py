@@ -26,7 +26,7 @@ from .jobs import EXECUTOR, HANDLERS
 
 # The ONE place the version is written. The installer reads it with sed and it
 # goes up in HELLO. Bump it when the agent or installer changes.
-VERSION = "1.2.8"
+VERSION = "1.3.0"
 
 CONFIG_PATH = Path(os.environ.get("AIOPS_AGENT_CONFIG",
                                   "/etc/proseth-aiops-agent/config.json"))
@@ -60,6 +60,31 @@ class _Denied(RuntimeError):
     """The platform refused us. Needs a person, not a retry."""
 
 
+LOCKDOWN_HELPER = "/usr/local/sbin/proseth-aiops-lockdown"
+
+
+async def lockdown_helper(arg: str) -> dict:
+    """Run the root helper (install.sh grants `on`, `off`, `status` and nothing
+    else) and read back what the machine REALLY is - never what was asked."""
+    if not os.path.exists(LOCKDOWN_HELPER):
+        return {"state": "unavailable", "error": "the lockdown helper is not installed - re-run the installer (agent 1.3.0+)"}
+    try:
+        proc = await asyncio.create_subprocess_exec("sudo", "-n", LOCKDOWN_HELPER, arg,
+                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
+    except (OSError, asyncio.TimeoutError) as exc:
+        return {"state": "unknown", "error": f"could not run the lockdown helper: {exc}"}
+    text = (out or b"").decode("utf-8", "replace").strip()
+    lines = text.splitlines()
+    status_line = next((ln for ln in reversed(lines) if ln.startswith("state=")), "")
+    res = dict(kv.split("=", 1) for kv in status_line.split() if "=" in kv)
+    if proc.returncode != 0 or not status_line:
+        res["error"] = (next((ln for ln in lines if ln.startswith("error:")), "") or text or
+                        f"exit {proc.returncode}")[-500:]
+        res.setdefault("state", "unknown")
+    return res
+
+
 class Agent:
     def __init__(self, config: dict):
         self.host = str(config.get("platform_host") or "").strip()
@@ -74,6 +99,7 @@ class Agent:
         self.cancelled: set[str] = set()
         self.running: set[str] = set()
         self._restarting = False
+        self.lockdown_state: dict = {}
 
         self.alert_secret = str(config.get("alert_secret") or "").strip()
         self.alert_port = int(config.get("alert_port") or protocol.DEFAULT_ALERT_PORT)
@@ -223,9 +249,10 @@ class Agent:
                                       ping_timeout=30, close_timeout=5,
                                       max_size=32 * 1024 * 1024) as socket:
             self.websocket = socket
+            self.lockdown_state = await lockdown_helper("status")       # what this machine really is
             await self.send(protocol.HELLO, token=self.token, version=VERSION,
                             protocol=protocol.PROTOCOL_VERSION, name=self.name,
-                            facts=facts.collect())
+                            facts=facts.collect(), lockdown=self.lockdown_state)
             raw = await asyncio.wait_for(socket.recv(), timeout=20)
             frame = protocol.parse(raw)
             if frame.get("t") == protocol.DENIED:
@@ -249,7 +276,7 @@ class Agent:
         while True:
             await asyncio.sleep(interval)
             payload = await asyncio.get_running_loop().run_in_executor(None, facts.collect)
-            if not await self.send(protocol.HEARTBEAT, facts=payload, ingest=self.ingest()):
+            if not await self.send(protocol.HEARTBEAT, facts=payload, ingest=self.ingest(), lockdown=self.lockdown_state):
                 return
 
     def ingest(self) -> dict:
@@ -294,8 +321,41 @@ class Agent:
             self.stop()
         elif kind == protocol.UPGRADE:
             await self.upgrade()
+        elif kind == protocol.LOCKDOWN:
+            asyncio.create_task(self.lockdown(str(frame.get("state") or ""), str(frame.get("contact") or "")))
         elif kind == protocol.DENIED:
             raise _Denied(frame.get("reason") or "no reason given")
+
+    async def lockdown(self, state: str, contact: str) -> None:
+        """Turn this machine's login lockdown on or off, as the platform says. The
+        root helper takes ONLY on|off|status; the contact line goes through a file,
+        cut to printable text by the helper too."""
+        if state not in ("on", "off"):
+            return
+        if state == "on":
+            path = str(STATE_DIR / "lockdown-contact")
+            text = "".join(ch for ch in contact if ch.isprintable())[:200]
+            for attempt in (1, 2):
+                try:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                    break
+                except OSError as exc:
+                    # A file someone else left there (found live: root-owned) - the
+                    # directory is ours, so replace it rather than show a stale contact.
+                    if attempt == 1:
+                        try:
+                            os.unlink(path)
+                            continue
+                        except OSError:
+                            pass
+                    log.warning("Could not write the lockdown contact line: %s", exc)
+                    break
+        log.info("Login lockdown %s requested by the platform", state.upper())
+        self.lockdown_state = await lockdown_helper(state)
+        if self.lockdown_state.get("error"):
+            log.error("Login lockdown %s FAILED: %s", state, self.lockdown_state["error"])
+        await self.send(protocol.HEARTBEAT, facts=facts.collect(), ingest=self.ingest(), lockdown=self.lockdown_state)
 
     async def upgrade(self) -> None:
         """Run the updater (installed by install.sh, granted one sudoers line)."""

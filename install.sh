@@ -223,9 +223,19 @@ exec systemd-run --no-block --unit="proseth-aiops-update-$(date +%s)" /bin/bash 
 EOF
 chmod 755 /usr/local/bin/proseth-aiops-agent /usr/local/bin/proseth-aiops-setup
 chmod 755 /usr/local/sbin/proseth-aiops-selfupdate; chown root:root /usr/local/sbin/proseth-aiops-selfupdate
+# Login lockdown (on | off | status only), switched from the platform by an administrator.
+LOCK=/usr/local/sbin/proseth-aiops-lockdown
+if [ -f "$SRC/lockdown.sh" ]; then
+  sed -e 's|@PRODUCT@|Proseth AIOps|g' -e 's|@NAME@|proseth-aiops|g' \
+      -e "s|@CONTACT_FILE@|$STATE_DIR/lockdown-contact|g" "$SRC/lockdown.sh" > "$LOCK.new" \
+    && install -m 755 -o root -g root "$LOCK.new" "$LOCK"; rm -f "$LOCK.new"
+  [ "$SRC/lockdown.sh" != "$PREFIX/lockdown.sh" ] && cp "$SRC/lockdown.sh" "$PREFIX/lockdown.sh"
+  ok "login lockdown helper installed (off until the platform turns it on)"
+fi
 # Validated before it is installed: a broken sudoers file breaks sudo for everyone.
 TMP_SUDO="$(mktemp)"
-echo "$RUN_USER ALL=(root) NOPASSWD: /usr/local/sbin/proseth-aiops-selfupdate" > "$TMP_SUDO"
+{ echo "$RUN_USER ALL=(root) NOPASSWD: /usr/local/sbin/proseth-aiops-selfupdate"
+  [ -x "$LOCK" ] && echo "$RUN_USER ALL=(root) NOPASSWD: $LOCK on, $LOCK off, $LOCK status"; } > "$TMP_SUDO"
 if visudo -cf "$TMP_SUDO" >/dev/null 2>&1; then
   install -m 440 -o root -g root "$TMP_SUDO" /etc/sudoers.d/proseth-aiops-agent; ok "one-click upgrade enabled"
 else
