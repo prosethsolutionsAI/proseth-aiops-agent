@@ -35,9 +35,18 @@ if ($AssetIP -and ($mine -notcontains $AssetIP)) {
 
 try {
     Write-Host "`n=== 1. WinRM on ($env:COMPUTERNAME)"
-    Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
-    Set-Service WinRM -StartupType Automatic
-    Start-Service WinRM
+    # Enable-PSRemoting RESTARTS WinRM even when it is already on - which kills the
+    # session this runs in when it was started over WinRM (or by a deployment tool).
+    # So it is called only when WinRM is not already answering with a listener.
+    $svc = Get-Service WinRM
+    $listening = $false
+    if ($svc.Status -eq 'Running') {
+        try { $listening = [bool](Get-ChildItem WSMan:\localhost\Listener -ErrorAction Stop |
+                Where-Object { $_.Keys -contains 'Transport=HTTP' -or $_.Keys -contains 'Transport=HTTPS' }) } catch {} }
+    if ($listening) { Write-Host '  WinRM already on - left running (not restarted)' }
+    else { Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null }
+    if ($svc.StartType -ne 'Automatic') { Set-Service WinRM -StartupType Automatic }
+    if ((Get-Service WinRM).Status -ne 'Running') { Start-Service WinRM }
     Write-Host ' ok WinRM running, starts at boot' -ForegroundColor Green
 
     Write-Host "`n=== 2. Firewall"

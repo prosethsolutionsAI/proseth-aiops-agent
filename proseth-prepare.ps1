@@ -53,7 +53,10 @@ $failed = @()
 Write-Host "`n=== Proseth AIOps: getting ready"
 if ($SkipWinRM) { Write-Host '  WinRM left as it is (-SkipWinRM) - the AIOps collector needs it on to read events' }
 else {
-    try { Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null; Write-Host ' ok WinRM is on' -ForegroundColor Green }
+    # Enable-PSRemoting restarts WinRM even when it is on, killing a session run over WinRM.
+    $wl = $false
+    if ((Get-Service WinRM -ErrorAction SilentlyContinue).Status -eq 'Running') { try { $wl = [bool](Get-ChildItem WSMan:\localhost\Listener -ErrorAction Stop) } catch {} }
+    try { if (-not $wl) { Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null }; Write-Host ' ok WinRM is on' -ForegroundColor Green }
     catch { Write-Host "  could not switch WinRM on: $($_.Exception.Message)"; $failed += 'aiops' }
 }
 
